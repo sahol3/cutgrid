@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CutGrid · song preview for editors</title>
+<meta name="description" content="Paste a YouTube link or drop a track. CutGrid maps the beat grid, drops, sections and punch, then previews the cut rhythm before you open your editor.">
+<meta property="og:title" content="CutGrid">
+<meta property="og:description" content="An editor's preview of a song: BPM, beat grid, drops, punch and the best reel window.">
+<meta name="theme-color" content="#0f0e0d">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f0e0d'/%3E%3Cpath d='M7 8v16M12 12v8M17 6v20M22 12v8M26 9v14' stroke='%23ff5b2e' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://api.fontshare.com">
+<link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700,900&display=swap">
+<link rel="stylesheet" href="style.css?v=4">
+</head>
+<body>
+<header class="top">
+  <a class="mark" href="./" aria-label="CutGrid home">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M7 8v16M12 12v8M17 6v20M22 12v8M26 9v14"/></svg>
+    <span>CutGrid</span>
+  </a>
+  <p class="tag">Hear how a song will cut before it touches your timeline.</p>
+</header>
+
+<main>
+  <section class="load" id="load">
+    <form class="linkbar" id="linkForm" autocomplete="off">
+      <label for="link" class="sr">YouTube link</label>
+      <input id="link" type="url" inputmode="url" placeholder="Paste a YouTube song or instrumental link" spellcheck="false">
+      <button type="submit" class="btn primary">Load</button>
+    </form>
+    <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose an audio file">
+      <input type="file" id="file" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.opus,.aac,.webm" hidden>
+      <strong>Or drop an audio file here</strong>
+      <span>MP3, WAV, M4A, FLAC or OGG. Analysis takes a few seconds and the file never leaves your browser.</span>
+    </div>
+  </section>
+
+  <section class="stage" id="stage" hidden>
+    <div class="source">
+      <div class="srcHead">
+        <div>
+          <p class="eyebrow" id="srcKind">Source</p>
+          <h1 id="srcTitle">Untitled</h1>
+        </div>
+        <button class="btn ghost small" id="resetBtn" type="button">New song</button>
+      </div>
+      <div class="player" id="ytWrap" hidden><div id="yt"></div></div>
+      <div class="capture" id="capturePanel" hidden>
+        <p>A web page cannot download audio from YouTube, so CutGrid listens to the player instead. Press Listen, choose <b>this tab</b> and keep <b>Share tab audio</b> switched on. The song plays from the start and the readout fills in while it plays. You can stop early; everything heard so far gets analysed.</p>
+        <div class="row">
+          <button class="btn primary" id="listenBtn" type="button">Listen and analyse</button>
+          <button class="btn ghost" id="stopBtn" type="button" hidden>Stop listening</button>
+          <span class="status" id="capStatus" aria-live="polite"></span>
+        </div>
+        <p class="fine">Works in Chrome and Edge on desktop. If an ad plays first, let it finish before pressing Listen. Videos that block embedding need the file route.</p>
+      </div>
+      <div class="transport" id="transport" hidden>
+        <button class="btn icon" id="playBtn" type="button" aria-label="Play">
+          <svg viewBox="0 0 24 24" class="i-play"><path d="M8 5.5v13l10.5-6.5z"/></svg>
+          <svg viewBox="0 0 24 24" class="i-pause"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></svg>
+        </button>
+        <span class="clock" id="clock">0:00.0</span>
+        <label class="chk"><input type="checkbox" id="clickOn"> Click on cuts</label>
+        <label class="nudge">Sync <input type="range" id="nudge" min="-250" max="250" step="5" value="0"><output id="nudgeOut">0 ms</output></label>
+      </div>
+      <div class="resultsTop" id="resultsTop" hidden>
+        <div class="verdict">
+          <div class="big">
+            <span class="num" id="overall">--</span>
+            <span class="lbl">edit power</span>
+          </div>
+          <div class="vtext">
+            <h2 id="headline">Listening…</h2>
+            <p id="summary"></p>
+          </div>
+          <div class="tempo">
+            <span class="num" id="bpm">--</span>
+            <span class="lbl" id="bpmAlt">BPM</span>
+          </div>
+        </div>
+
+        <div class="tl">
+          <div class="tlHead">
+            <h3>Timeline</h3>
+            <div class="legend">
+              <span><i class="k-beat"></i>beat</span><span><i class="k-bar"></i>bar</span><span><i class="k-kick"></i>kick</span><span><i class="k-snare"></i>snare/clap</span><span><i class="k-hat"></i>hat</span><span><i class="k-acc"></i>big hit</span><span><i class="k-drop"></i>drop</span><span><i class="k-win"></i>best 15 s</span>
+            </div>
+            <div class="zoom"><button class="btn ghost small" id="zoomOut" type="button" aria-label="Zoom out">−</button><button class="btn ghost small" id="zoomIn" type="button" aria-label="Zoom in">+</button><button class="btn ghost small" id="zoomFit" type="button">Fit</button></div>
+          </div>
+          <canvas id="timeline" height="260" aria-label="Song timeline with beat grid"></canvas>
+          <p class="fine">Click to jump. Scroll to zoom, drag to pan. Faded grid lines are extended through parts with no drums.</p>
+        </div>
+      </div>
+    </div>
+
+    <aside class="preview">
+      <div class="phone" id="phone" aria-label="Cut preview">
+        <div class="shot" id="shot"><span class="shotNo" id="shotNo">01</span><span class="shotSec" id="shotSec">Intro</span></div>
+        <div class="flash" id="flash"></div>
+        <div class="hud"><span id="hudBeat">bar 1 · beat 1</span><span id="hudCuts">0 cuts</span></div>
+      </div>
+      <label class="cad">Cut on
+        <select id="cadence">
+          <option value="auto">Auto plan (by section)</option>
+          <option value="1">Every beat</option>
+          <option value="2">Every 2 beats</option>
+          <option value="4">Every bar</option>
+          <option value="0.5">Every half beat</option>
+          <option value="accent">Big hits only</option>
+          <option value="kick">Every kick</option>
+        </select>
+      </label>
+      <p class="fine">Each card is a placeholder shot. Press play to feel the cut rhythm; big hits punch in, drops flash.</p>
+    </aside>
+  </section>
+
+  <section class="results" id="results" hidden>
+    <div class="grid2">
+      <div class="card">
+        <h3>How it scores</h3>
+        <div id="scores"></div>
+      </div>
+      <div class="card">
+        <h3>Edit fit</h3>
+        <div id="fits"></div>
+        <h3 class="mt">Best windows for a reel</h3>
+        <div id="windows"></div>
+      </div>
+    </div>
+
+    <div class="grid3">
+      <div class="card">
+        <h3>Beat spacing</h3>
+        <table class="kv" id="spacing"></table>
+      </div>
+      <div class="card">
+        <h3>Gaps between hits</h3>
+        <canvas id="ioi" height="150"></canvas>
+        <p class="fine" id="gridName"></p>
+      </div>
+      <div class="card">
+        <h3>Tempo over time</h3>
+        <canvas id="tempo" height="150"></canvas>
+        <p class="fine" id="tempoNote"></p>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <h3>Sections and cut plan</h3>
+        <table class="list" id="sections"></table>
+      </div>
+      <div class="card">
+        <h3>Drops, big hits and gaps</h3>
+        <table class="list" id="moments"></table>
+      </div>
+    </div>
+
+    <div class="card exports">
+      <h3>Take it into the edit</h3>
+      <p>Markers carry the time in seconds and as a 30 fps timecode.</p>
+      <div class="row">
+        <button class="btn ghost" type="button" data-export="csv">Markers CSV</button>
+        <button class="btn ghost" type="button" data-export="audacity">Audacity labels</button>
+        <button class="btn ghost" type="button" data-export="json">Full JSON</button>
+        <button class="btn ghost" type="button" id="copyCuts">Copy cut list (current cadence)</button>
+        <span class="status" id="exportStatus" aria-live="polite"></span>
+      </div>
+    </div>
+
+    <details class="card how">
+      <summary>How the numbers work</summary>
+      <p>CutGrid splits the audio into 11.6 ms frames, measures how sharply the spectrum jumps in the bass, mid and treble bands, and finds the tempo from how those jumps repeat. A beat tracker then lays the grid, and bar starts come from where the kick and snare fall. Sections come from changes in tone and loudness bar by bar, and a drop is a bar where the level and the low end both jump.</p>
+      <p>The scores are heuristics tuned on EDM, phonk, lofi, trap, ambient techno, piano and film score. Punch is how far the spectrum leaps on each beat, Pulse is how clearly the grid can be heard, Payoff is the strongest drop plus the dynamic range, Drive is how busy the hits are, and Hook rates the best 15 second window's opening second. Edit power weights them 30, 20, 20, 15 and 15. Treat them as a fast first read and trust your ears for the final call.</p>
+    </details>
+  </section>
+</main>
+
+<footer class="foot">
+  <span>CutGrid runs entirely in your browser. Nothing is uploaded.</span>
+  <a href="https://github.com/sahol3/cutgrid">Source on GitHub</a>
+</footer>
+
+<script type="module" src="app.js?v=4"></script>
+</body>
+</html>
