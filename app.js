@@ -19,11 +19,31 @@ function tc30(t) { const f = Math.round(t * 30), ff = f % 30, s = Math.floor(f /
 const secs = v => `${v.toFixed(v < 1 ? 3 : 2)} s`;
 
 // ---------- worker ----------
-const VERSION = '4';
+const VERSION = '5';
 const worker = new Worker(`worker.js?v=${VERSION}`, { type: 'module' });
 let jobId = 0; const jobs = new Map();
-worker.onmessage = e => { const j = jobs.get(e.data.id); if (j) { jobs.delete(e.data.id); e.data.error ? j.reject(new Error(e.data.error)) : j.resolve(e.data.result); } };
-function runAnalysis(samples, sr) { const id = ++jobId; return new Promise((resolve, reject) => { jobs.set(id, { resolve, reject }); worker.postMessage({ id, samples, sr }, [samples.buffer]); }); }
+worker.onmessage = e => {
+  const d = e.data, j = jobs.get(d.id); if (!j) return;
+  if (d.error) { jobs.delete(d.id); j.reject(new Error(d.error)); return; }
+  if (d.progress) { j.onProgress?.(d.progress); return; }
+  if (!d.final) { j.onPartial?.(d.result); return; }
+  jobs.delete(d.id); if (d.mlError) d.result.mlError = d.mlError; j.resolve(d.result);
+};
+// ml: also run the neural pass (Beat This! + EffNet). onPartial gets the quick DSP read first.
+function runAnalysis(samples, sr, { ml = false, onPartial, onProgress } = {}) {
+  const id = ++jobId;
+  return new Promise((resolve, reject) => { jobs.set(id, { resolve, reject, onPartial, onProgress }); worker.postMessage({ id, samples, sr, ml }, [samples.buffer]); });
+}
+function setModelStatus(text, cls = '') { const el = $('modelStatus'); if (el) { el.textContent = text; el.className = 'modelStatus ' + cls; } }
+const modelOpts = () => ({
+  ml: true,
+  onPartial: r => { showResult(r, false); setModelStatus('Quick read shown. The neural pass is listening for the real beat and feel…', 'busy'); },
+  onProgress: p => setModelStatus(`${p.stage}${p.backend ? ` (${p.backend})` : ''}… ${Math.round(p.p * 100)}%`, 'busy'),
+});
+function modelDone(r) {
+  if (r.mlError) setModelStatus(`The neural pass could not run here (${r.mlError}). Showing the quick read.`, 'err');
+  else if (r.model?.used) setModelStatus(`Neural pass done on ${r.model.backend} in ${(r.mlMs / 1000).toFixed(1)} s.`, 'ok');
+}
 
 // ---------- loading ----------
 function parseYouTube(s) {
@@ -88,7 +108,7 @@ async function useBuffer(buf) {
   const mono = new Float32Array(buf.length);
   for (const ch of chans) for (let i = 0; i < mono.length; i++) mono[i] += ch[i] / chans.length;
   setHeadline('Analysing…', `${fmt(buf.duration, 0)} of audio.`);
-  try { showResult(await runAnalysis(mono, buf.sampleRate), true); }
+  try { const r = await runAnalysis(mono, buf.sampleRate, modelOpts()); showResult(r, true); modelDone(r); }
   catch (err) { setHeadline('Analysis failed', String(err.message || err)); }
 }
 
@@ -186,7 +206,11 @@ async function liveAnalyse(final = false) {
   if (S.analysing) { S.pendingLive = S.pendingLive || final; return; }
   if (c.max < c.sr * 5) return;
   S.analysing = true;
-  try { const r = await runAnalysis(c.buf.slice(0, c.max), c.sr); showResult(r, final); }
+  try {
+    // live reads during capture stay DSP only; the final one runs the neural pass
+    const r = await runAnalysis(c.buf.slice(0, c.max), c.sr, final ? modelOpts() : {});
+    showResult(r, final); if (final) modelDone(r);
+  }
   catch (err) { console.error(err); }
   S.analysing = false;
   if (S.pendingLive) { S.pendingLive = false; liveAnalyse(true); }
@@ -255,12 +279,24 @@ function tick() {
 }
 
 // ---------- cuts ----------
+// bar and beat of grid line i (1-based). The engine gives bar positions; older results fall back to phase.
+function barBeat(r, i) {
+  if (i < 0) return { bar: 0, beat: 1 };
+  if (r.beatPos) return { bar: r.barNo[i], beat: r.beatPos[i] + 1 };
+  const rel = i - r.phase; return { bar: Math.floor(rel / 4) + 1, beat: ((rel % 4) + 4) % 4 + 1 };
+}
+// is grid line i on a cut when cutting every k beats (k a fraction of a bar, a bar, or whole bars)
+function onEvery(r, i, k) {
+  const { bar, beat } = barBeat(r, i), m = r.meter || 4;
+  if (k >= m) { const bars = Math.max(1, Math.round(k / m)); return beat === 1 && bar >= 1 && (bar - 1) % bars === 0; }
+  return (beat - 1) % k === 0;
+}
 function buildCuts() {
   const r = S.result; if (!r?.ok) { S.cuts = []; return; }
-  const B = r.beats, ph = r.phase, out = [0];
+  const B = r.beats, out = [0];
   const every = (k, from = 0, to = Infinity) => {
     if (k === 0.5) { for (let i = 0; i < B.length; i++) { if (B[i] >= from && B[i] < to) out.push(B[i]); const m = i + 1 < B.length ? (B[i] + B[i + 1]) / 2 : B[i] + r.beatDur / 2; if (m >= from && m < to) out.push(m); } return; }
-    for (let i = 0; i < B.length; i++) if (B[i] >= from && B[i] < to && (((i - ph) % k) + k) % k === 0) out.push(B[i]);
+    for (let i = 0; i < B.length; i++) if (B[i] >= from && B[i] < to && onEvery(r, i, k)) out.push(B[i]);
   };
   const c = S.cadence;
   if (c === 'accent') r.hits.accent.forEach(h => out.push(h.t));
@@ -294,7 +330,7 @@ function updatePreview(t) {
     }
   }
   const bi = upperIdx(r.beats, t);
-  if (bi >= 0) { const rel = bi - r.phase, bar = Math.floor(rel / 4) + 1, beat = ((rel % 4) + 4) % 4 + 1; $('hudBeat').textContent = `bar ${Math.max(0, bar)} · beat ${beat}`; }
+  if (bi >= 0) { const { bar, beat } = barBeat(r, bi), calm = r.beatConf && r.beatConf[bi] < 0.2; $('hudBeat').textContent = calm ? 'no beat here' : `bar ${Math.max(0, bar)} · beat ${beat}`; }
 }
 
 // ---------- render loop ----------
@@ -349,13 +385,22 @@ function drawStatic() {
   for (let x = 0; x < w; x += 2) { const f = fOf(tOf(x, w)); if (f >= cv.energy.length) break; const y = TL.mainTop + TL.mainH - 6 - cv.energy[f] * (TL.mainH - 14); x ? g.lineTo(x, y) : g.moveTo(x, y); }
   g.stroke();
   // beat grid
-  const det = r.detected || [0, r.duration], beatPx = r.beatDur * ppS;
+  // calm stretches: where the neural tracker hears no pulse, shade the area and say so
+  if (cv.activity) {
+    let runA = -1;
+    const flush = (a, b) => { if (b - a < 3) return; g.fillStyle = 'rgba(15,14,13,.55)'; g.fillRect(a, TL.mainTop, b - a, TL.laneTop + 72 - TL.mainTop); if (b - a > 70) { g.fillStyle = '#8d877c'; g.fillText('no beat', a + 6, TL.mainTop + TL.mainH - 16); } };
+    for (let x = 0; x <= w; x++) {
+      const f = fOf(tOf(x, w)), calm = f < cv.activity.length && cv.activity[f] < 0.2 && cv.energy[f] > 0.02;
+      if (calm && runA < 0) runA = x; if ((!calm || x === w) && runA >= 0) { flush(runA, x); runA = -1; }
+    }
+  }
+  const det = r.detected || [0, r.duration], beatPx = r.beatDur * ppS, M = r.meter || 4;
   r.beats.forEach((b, i) => {
     if (b < t0 || b > t1) return;
-    const isBar = (((i - r.phase) % 4) + 4) % 4 === 0, inside = b >= det[0] - 0.05 && b <= det[1] + 0.05;
-    if (!isBar && beatPx < 5) return; if (isBar && beatPx * 4 < 4) return;
-    const x = Math.round(xOf(b, w)) + 0.5;
-    g.strokeStyle = isBar ? `rgba(238,233,224,${inside ? 0.32 : 0.12})` : `rgba(238,233,224,${inside ? 0.1 : 0.04})`;
+    const isBar = barBeat(r, i).beat === 1, conf = r.beatConf ? r.beatConf[i] : (b >= det[0] - 0.05 && b <= det[1] + 0.05 ? 1 : 0.3);
+    if (!isBar && beatPx < 5) return; if (isBar && beatPx * M < 4) return;
+    const x = Math.round(xOf(b, w)) + 0.5, k = 0.3 + 0.7 * Math.min(1, conf / 0.6);
+    g.strokeStyle = isBar ? `rgba(238,233,224,${(0.34 * k).toFixed(3)})` : `rgba(238,233,224,${(0.11 * k).toFixed(3)})`;
     g.lineWidth = 1; g.beginPath(); g.moveTo(x, TL.mainTop); g.lineTo(x, TL.laneTop + 72); g.stroke();
   });
   // lanes
@@ -400,8 +445,8 @@ function drawTimelineFrame(t) {
   const x = xOf(t, w);
   if (x >= 0 && x <= w) { g.fillStyle = '#ff5b2e'; g.fillRect(x - 1, 0, 2, TL.laneTop + 72); }
   if (S.hover !== null && S.result?.ok) {
-    const ht = tOf(S.hover, w), r = S.result, bi = upperIdx(r.beats, ht);
-    const rel = bi - r.phase, label = `${fmt(ht, 2)}  ·  bar ${Math.max(0, Math.floor(rel / 4) + 1)}.${((rel % 4) + 4) % 4 + 1}`;
+    const ht = tOf(S.hover, w), r = S.result, bi = upperIdx(r.beats, ht), bb = barBeat(r, bi);
+    const label = `${fmt(ht, 2)}  ·  bar ${Math.max(0, bb.bar)}.${bb.beat}${r.beatConf && bi >= 0 ? `  ·  beat ${Math.round(r.beatConf[bi] * 100)}% sure` : ''}`;
     g.strokeStyle = 'rgba(238,233,224,.5)'; g.lineWidth = 1; g.beginPath(); g.moveTo(S.hover + 0.5, TL.mainTop); g.lineTo(S.hover + 0.5, TL.laneTop + 72); g.stroke();
     g.font = '700 12px Satoshi, system-ui, sans-serif'; const tw = g.measureText(label).width + 14, bx = Math.min(w - tw, S.hover + 8);
     g.fillStyle = 'rgba(15,14,13,.92)'; g.fillRect(bx, TL.mainTop + 22, tw, 22); g.fillStyle = '#eee9e0'; g.textBaseline = 'middle'; g.fillText(label, bx + 7, TL.mainTop + 33);
@@ -446,7 +491,7 @@ function showResult(r, final) {
   const alt = r.bpm < 100 ? r.bpm * 2 : r.bpm > 140 ? r.bpm / 2 : null;
   $('bpmAlt').textContent = alt ? `BPM · or ${Math.round(alt)}` : 'BPM';
   const fits = Object.entries(r.fits).sort((a, b) => b[1] - a[1]);
-  const head = s.overall >= 80 ? 'Strong edit track' : s.overall >= 65 ? 'Cuts well with the right pacing' : s.overall >= 50 ? 'Usable for the right section' : 'Better as a background bed';
+  const head = s.overall >= 75 ? 'Strong edit track' : s.overall >= 55 ? 'Cuts well with the right pacing' : s.overall >= 35 ? 'Usable for the right section' : 'Better as a background bed';
   const w15 = r.windows[15] || r.windows[7];
   const bigDrop = r.drops.slice().sort((a, b) => b.jumpDb + 0.3 * b.lowJumpDb - (a.jumpDb + 0.3 * a.lowJumpDb))[0];
   const parts = [
@@ -460,12 +505,20 @@ function showResult(r, final) {
   const pct = v => Math.round(v * 100);
   const rows = [
     ['Punch', s.punch, `How hard the hits land. Each beat lifts the spectrum by ${m.rawRise} on average and the bass by ${m.rawLowRise}; soft piano sits near 0.03 and a hard club kick near 0.6.`],
-    ['Pulse', s.pulse, `How easy the grid is to cut to. ${pct(m.hitRatio)}% of beats carry an audible hit and the tempo ${r.tempoDrift < 3 ? 'holds steady' : `moves by about ${r.tempoDrift} BPM`}.`],
+    ['Pulse', s.pulse, m.confMean !== null && m.confMean !== undefined
+      ? `How clearly the beat can be felt. The beat model is sure of ${pct(m.strongShare)}% of beats${m.calmShare > 0.05 ? `, and ${pct(m.calmShare)}% of the song has no beat to cut on` : ''}. The tempo ${r.tempoDrift < 3 ? 'holds steady' : `moves by about ${r.tempoDrift} BPM`}.`
+      : `How easy the grid is to cut to. ${pct(m.hitRatio)}% of beats carry an audible hit and the tempo ${r.tempoDrift < 3 ? 'holds steady' : `moves by about ${r.tempoDrift} BPM`}.`],
+    ...(s.intensity !== undefined ? [['Intensity', s.intensity, `How hard and edgy the music feels to the mood model: aggressive ${pct(r.model.feel.mood.aggressive)}%, relaxed ${pct(r.model.feel.mood.relaxed)}%. It is the strongest single sign of a song editors reach for.`]] : []),
     ['Payoff', s.payoff, r.drops.length ? `${r.drops.length} drop${r.drops.length > 1 ? 's' : ''}, the strongest lifting the level ${m.strongestDrop} dB. Loud and quiet parts sit ${m.lra} dB apart.` : `No drop found. Loud and quiet parts sit ${m.lra} dB apart.`],
     ['Drive', s.drive, `${m.onsetRate} hits a second with a ${r.grid.name} feel. Higher means more material to cut on.`],
     ['Hook', s.hook, w15 ? `The best window opens at ${pct(w15.firstSec)}% of peak energy${w15.startHit > 0.5 ? ' on a clear hit' : ''}${w15.dropAt !== null && Math.abs(w15.dropAt - w15.start) < 0.2 ? ' and right on a drop' : ''}. The first second decides the scroll.` : 'The song is too short to pick a window.'],
   ];
-  $('scores').innerHTML = rows.map(([n, v, why]) => `<div class="score"><span class="name">${n}</span>${bar(v, v >= 75)}<span class="val">${v}</span><p class="why">${why}</p></div>`).join('');
+  const CN = { intensity: 'intensity', edge: 'an unusual, edgy sound', drops: 'the number of drops', dropSize: 'drop size', density: 'a dense, busy texture', sustain: 'hits that hold their weight', hook: 'a strong opening window' };
+  const cs = Object.entries(r.editPower?.contrib || {}).filter(([, v]) => Math.abs(v) >= 0.15).sort((a, b) => b[1] - a[1]);
+  const CNN = { intensity: 'a soft, relaxed mood', edge: 'a smooth, familiar sound', drops: 'few drops', dropSize: 'small drops', density: 'a sparse texture', sustain: 'hits that fade fast', hook: 'a weak opening window' };
+  const ups = cs.filter(([, v]) => v > 0).slice(0, 2).map(([k]) => CN[k]), downs = cs.filter(([, v]) => v < 0).slice(-2).reverse().map(([k]) => CNN[k]);
+  const powerWhy = `Edit power comes from a small model fitted on songs picked for edits against calm library tracks${r.editPower?.head === 'dsp' ? ' (quick-read version, less sure)' : ''}.${ups.length ? ` Lifted by ${ups.join(' and ')}.` : ''}${downs.length ? ` Held back by ${downs.join(' and ')}.` : ''}`;
+  $('scores').innerHTML = `<p class="why powerWhy">${powerWhy}</p>` + rows.map(([n, v, why]) => `<div class="score"><span class="name">${n}</span>${bar(v, v >= 75)}<span class="val">${v}</span><p class="why">${why}</p></div>`).join('');
   $('fits').innerHTML = fits.map(([k, v], i) => `<div class="score"><span class="name" style="grid-column:1/3">${FIT_NAMES[k]}</span><span class="val">${v}</span><div style="grid-column:1/-1">${bar(v, i === 0)}</div></div>`).join('');
 
   $('windows').innerHTML = [7, 15, 30].map(L => {
@@ -485,7 +538,9 @@ function showResult(r, final) {
   $('gridName').textContent = `Most hits are spaced like ${r.grid.name}. Peaks at 1/4 mean 16th notes, 1/3 and 2/3 mean triplets or swing.`;
   $('tempoNote').textContent = r.tempoDrift < 3 ? 'Flat line: the grid holds, so a fixed cut rate stays on beat.' : `The tempo moves by about ${r.tempoDrift} BPM. Re-check cuts against the grid in the later parts.`;
 
-  $('sections').innerHTML = `<tr><th>Start</th><th>Part</th><th>Cut every</th><th>Shot length</th></tr>` + r.cutPlan.map(p => `<tr><td><button class="jump" data-t="${p.start}">${fmt(p.start, 0)}</button></td><td><span class="pill${p.label === 'Peak' ? ' peak' : ''}">${p.label}</span></td><td>${p.everyBeats === 0.5 ? 'half beat' : p.everyBeats === 1 ? 'beat' : p.everyBeats === 4 ? 'bar' : p.everyBeats + ' beats'}</td><td>${secs(p.shotSec)}</td></tr>`).join('');
+  const M = r.meter || 4, every = k => (k === 0.5 ? 'half beat' : k === 1 ? 'beat' : k === M ? 'bar' : k % M === 0 ? `${k / M} bars` : k + ' beats');
+  $('sections').innerHTML = `<tr><th>Start</th><th>Part</th><th>Cut every</th><th>Shot length</th></tr>` + r.cutPlan.map(p => `<tr><td><button class="jump" data-t="${p.start}">${fmt(p.start, 0)}</button></td><td><span class="pill${p.label === 'Peak' ? ' peak' : ''}">${p.label}</span>${p.calm ? ' <span class="pill calm">no beat</span>' : ''}</td><td>${every(p.everyBeats)}${p.calm ? ', or on big hits' : ''}</td><td>${secs(p.shotSec)}</td></tr>`).join('');
+  renderFeel(r);
   const moments = [
     ...r.drops.map(d => [d.t, 'Drop', `level +${d.jumpDb} dB, bass +${d.lowJumpDb} dB${d.build ? ', riser before it' : ''}${d.gapBefore ? ', pause right before' : ''}`]),
     ...r.hits.accent.slice().sort((a, b) => b.s - a.s).slice(0, 8).map(a => [a.t, 'Big hit', 'punch in or flash here']),
@@ -494,6 +549,18 @@ function showResult(r, final) {
   $('moments').innerHTML = moments.length ? moments.map(([t, k, d]) => `<tr><td><button class="jump" data-t="${t}">${fmt(t)}</button></td><td>${k}</td><td>${d}</td></tr>`).join('') : '<tr><td>None found</td></tr>';
   drawSmallCharts();
   if (final && S.mode === 'yt') $('capStatus').textContent += ` Analysed ${fmt(r.duration, 0)} in ${r.ms} ms.`;
+}
+
+const MOOD_NAMES = { aggressive: 'Aggressive', party: 'Party', danceable: 'Danceable', relaxed: 'Relaxed', engagement: 'Holds attention', approachability: 'Easy on the ear' };
+function renderFeel(r) {
+  const el = $('feel'); if (!el) return;
+  const f = r.model?.feel;
+  if (!f) { el.innerHTML = `<p class="fine">${r.model?.used === false && !r.mlError ? 'Waiting for the neural pass…' : 'The feel needs the neural pass, which did not run.'}</p>`; return; }
+  const styles = f.styles.slice(0, 3).map(([n, p]) => `<span class="pill">${n.split('---').pop()}</span>`).join(' ');
+  el.innerHTML = `<p class="styles">${styles}</p>` + Object.entries(MOOD_NAMES).filter(([k]) => f.mood[k] !== undefined).map(([k, n]) => {
+    const v = Math.round(f.mood[k] * 100);
+    return `<div class="score"><span class="name">${n}</span>${bar(v, false)}<span class="val">${v}</span></div>`;
+  }).join('') + `<p class="fine">From Discogs-EffNet (MTG, Essentia) and its mood heads, averaged over the song. Styles are the top Discogs labels.</p>`;
 }
 
 document.addEventListener('click', e => {
@@ -529,7 +596,7 @@ function download(name, text, type) { const a = document.createElement('a'); a.h
 const slug = () => (S.title || 'song').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'song';
 function markerRows() {
   const r = S.result, rows = [];
-  r.beats.forEach((b, i) => { const rel = i - r.phase, bar = Math.floor(rel / 4) + 1, bt = ((rel % 4) + 4) % 4 + 1; rows.push([bt === 1 ? 'bar' : 'beat', b, `bar ${bar} beat ${bt}`]); });
+  r.beats.forEach((b, i) => { if (r.beatConf && r.beatConf[i] < 0.2) return; const { bar, beat: bt } = barBeat(r, i); rows.push([bt === 1 ? 'bar' : 'beat', b, `bar ${bar} beat ${bt}`]); });
   r.drops.forEach(d => rows.push(['drop', d.t, `drop +${d.jumpDb} dB`]));
   r.sections.forEach(s => rows.push(['section', s.start, s.label]));
   r.hits.accent.forEach(a => rows.push(['big_hit', a.t, 'big hit']));

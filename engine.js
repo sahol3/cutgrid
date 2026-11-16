@@ -3,6 +3,9 @@
 // Input: mono Float32Array + sample rate. Output: a plain object an editor can read.
 
 export const TARGET_SR = 22050;
+// fitted by tests/fit.mjs on the labelled corpus (lambda 2); features are standardised with mu and sd
+const EDIT_HEAD = { names: ['intensity', 'edge', 'drops', 'dropSize', 'density', 'sustain', 'hook'], mu: [-3.3446, 0.1228, 2.2048, 12.2651, 0.7457, -2.0217, 0.892], sd: [1.5499, 0.8373, 1.4036, 7.152, 0.3435, 1.4182, 0.0884], w: [1.0268, 0.5149, 0.4707, 0.0014, 0.4614, 0.26, 0.3672], b: 0.0648 };
+const EDIT_HEAD_DSP = { names: ['drops', 'dropSize', 'density', 'sustain', 'hook'], mu: [2.2048, 12.2651, 0.7457, -2.0217, 0.892], sd: [1.4036, 7.152, 0.3435, 1.4182, 0.0884], w: [0.4768, -0.1832, 0.4773, 0.4341, 0.2981], b: 0.0891 };
 const N = 1024;          // FFT size (46 ms at 22.05 kHz)
 const HOP = 256;         // hop (11.6 ms) -> about 86 frames per second
 const ONSET_SHIFT = 0.013; // extra seconds added so markers land on the transient (measured on a click track)
@@ -224,9 +227,23 @@ export function analyze(samples, sr, opts = {}) {
   const envD = new Float32Array(nF); { const mm = movingMean(env, Math.round(0.5 * fps)); for (let i = 0; i < nF; i++) envD[i] = Math.max(0, env[i] - mm[i]); }
   const envStd = std(env), envMean = mean(env);
 
+  // neural beat activation (Beat This!), resampled onto the engine frames. Without it the DSP onset curve is used.
+  const ml = opts.ml && opts.ml.beat && opts.ml.beat.length ? opts.ml : null;
+  let act = null, dact = null;
+  if (ml) {
+    act = new Float32Array(nF); dact = new Float32Array(nF);
+    const m = ml.beat.length;
+    for (let i = 0; i < nF; i++) {
+      const p = (fT(i) - ONSET_SHIFT) * ml.fps, j = Math.floor(p), f = p - j;
+      if (j >= 0 && j + 1 < m) { act[i] = ml.beat[j] * (1 - f) + ml.beat[j + 1] * f; dact[i] = ml.down[j] * (1 - f) + ml.down[j + 1] * f; }
+    }
+  }
+  const confAt = f => { if (!act) return 1; let v = 0; for (let i = Math.max(0, f - 4); i <= Math.min(nF - 1, f + 4); i++) if (act[i] > v) v = act[i]; return v; };
+
   // tempo + beats
-  const tempo = estimateTempo(movingMean(movingMean(env, 3), 3), fps); // smoothed so sharp clicks still correlate at fractional lags
-  let beatsF = trackBeats(env, (60 * fps) / tempo.bpm);
+  const tEnv = act ? (() => { const o = new Float32Array(nF); for (let i = 0; i < nF; i++) o[i] = act[i] + 0.15 * clamp01(env[i] / (envMean + 4 * envStd)); return o; })() : env;
+  const tempo = estimateTempo(movingMean(movingMean(tEnv, 3), 3), fps); // smoothed so sharp clicks still correlate at fractional lags
+  let beatsF = trackBeats(tEnv, (60 * fps) / tempo.bpm);
   let bpm = tempo.bpm;
   if (beatsF.length >= 8) {
     // refine tempo by regression of beat frames on index (middle 80%)
@@ -236,7 +253,8 @@ export function analyze(samples, sr, opts = {}) {
     const slope = (c * sxy - sx * sy) / (c * sxx - sx * sx);
     if (slope > 0) bpm = (60 * fps) / slope;
   }
-  const beatDur = 60 / bpm, barDur = beatDur * 4;
+  const beatDur = 60 / bpm;
+  let barDur = beatDur * 4;
   const detected = beatsF.length ? [fT(beatsF[0]), fT(beatsF[beatsF.length - 1])] : [0, 0];
   // extend the grid at the same period through beatless intros and outros (drawn dimmer in the UI)
   let prepend = 0;
@@ -247,9 +265,12 @@ export function analyze(samples, sr, opts = {}) {
     prepend = head.length; beatsF = [...head, ...beatsF, ...tail];
   }
   const beats = beatsF.map(fT);
+  // how sure the network is that each grid line is a felt beat (1 without the model)
+  const beatConf = beatsF.map(f => +confAt(f).toFixed(2));
 
-  // beat strength + pulse clarity
-  const coreF = beatsF.filter(f => fT(f) >= detected[0] - 0.01 && fT(f) <= detected[1] + 0.01);
+  // beat strength + pulse clarity. With the model, only beats it can hear count; calm stretches no longer pass as pulse.
+  let coreF = beatsF.filter(f => fT(f) >= detected[0] - 0.01 && fT(f) <= detected[1] + 0.01);
+  if (act) { const sure = beatsF.filter((_, k) => beatConf[k] >= 0.35); if (sure.length >= 8) coreF = sure; }
   const atBeat = coreF.map(f => localMax(env, f, 2));
   const hitThr = envMean + 0.5 * envStd;
   const hitRatio = atBeat.length ? atBeat.filter(v => v > hitThr).length / atBeat.length : 0;
@@ -266,9 +287,30 @@ export function analyze(samples, sr, opts = {}) {
     return c ? 20 * Math.log10((pk + 1e-9) / (Math.sqrt(s / c) + 1e-9)) : 0;
   }));
 
-  // downbeats (bar starts)
-  let phase = 0;
-  if (beatsF.length >= 8) {
+  // downbeats (bar starts). With the model: Viterbi over bar position on its downbeat probability, meter 3 or 4,
+  // so a dropped or extra beat does not shift every later bar line.
+  let phase = 0, meter = 4, beatPos = null;
+  if (act && beatsF.length >= 8) {
+    const dp = beatsF.map(f => { let v = 0; for (let i = Math.max(0, f - 4); i <= Math.min(nF - 1, f + 4); i++) if (dact[i] > v) v = dact[i]; return v; });
+    const decode = S => {
+      const n = dp.length, stay = Math.log(0.998), jump = Math.log(0.002 / (S - 1));
+      const em = (k, s) => (s === 0 ? 2 * Math.log(dp[k] + 0.02) : Math.log(1.02 - dp[k]));
+      let sc = Array.from({ length: S }, (_, s) => em(0, s)); const back = [];
+      for (let k = 1; k < n; k++) {
+        const nx = new Array(S), bk = new Array(S);
+        for (let s = 0; s < S; s++) { let best = -Infinity, arg = 0; for (let p = 0; p < S; p++) { const v = sc[p] + (s === (p + 1) % S ? stay : jump); if (v > best) { best = v; arg = p; } } nx[s] = best + em(k, s); bk[s] = arg; }
+        sc = nx; back.push(bk);
+      }
+      let s = sc.indexOf(Math.max(...sc)); const pos = new Array(n); pos[n - 1] = s;
+      for (let k = n - 2; k >= 0; k--) { s = back[k][s]; pos[k] = s; }
+      const on = [], off = []; pos.forEach((q, k) => (q === 0 ? on : off).push(dp[k]));
+      return { pos, contrast: mean(on) - mean(off) };
+    };
+    const d4 = decode(4), d3 = decode(3), use3 = d3.contrast > d4.contrast + 0.12;
+    meter = use3 ? 3 : 4; beatPos = (use3 ? d3 : d4).pos;
+    phase = beatPos.findIndex(q => q === 0); if (phase < 0) phase = 0;
+    barDur = beatDur * meter;
+  } else if (beatsF.length >= 8) {
     const L = [0, 0, 0, 0], M = [0, 0, 0, 0], J = [0, 0, 0, 0], C = [0, 0, 0, 0];
     beatsF.forEach((f, i) => {
       const q = i % 4; L[q] += localMax(lowN, f, 2); M[q] += localMax(midN, f, 2) + localMax(highN, f, 2); C[q]++;
@@ -283,7 +325,9 @@ export function analyze(samples, sr, opts = {}) {
     }
   }
   void prepend;
-  const downF = beatsF.filter((_, i) => i % 4 === phase), downbeats = downF.map(fT);
+  if (!beatPos) beatPos = beatsF.map((_, i) => (((i - phase) % 4) + 4) % 4);
+  const barNo = []; { let b = 0; beatPos.forEach((q, i) => { if (q === 0 && i > 0) b++; barNo.push(b + (beatPos[0] === 0 ? 1 : 0)); }); }
+  const downF = beatsF.filter((_, i) => beatPos[i] === 0), downbeats = downF.map(fT);
 
   // hits per band
   const loM = mean(lowN), loS = std(lowN, loM);
@@ -296,8 +340,16 @@ export function analyze(samples, sr, opts = {}) {
   const accentPk = pickPeaks(env, fps, { delta: 3 * envStd, win: 2, minGap: 0.25 }).filter(([, v]) => v > envP95)
     .sort((a, b) => b[1] - a[1]).slice(0, Math.max(4, Math.ceil(duration / 3))).sort((a, b) => a[0] - b[0]);
   const allOnsets = pickPeaks(env, fps, { delta: 0.6 * envStd, minGap: 0.05 });
+  // where the network hears a pulse (0..1, smoothed over two bars). Calm stretches drop all but their biggest hits.
+  let activity = null;
+  if (act) {
+    const r = Math.max(1, Math.round(0.6 * beatDur * fps)), mx = new Float32Array(nF);
+    for (let i = 0; i < nF; i++) mx[i] = localMax(act, i, r);
+    activity = movingMean(mx, Math.round(2 * barDur * fps));
+  }
+  const gate = pk => { if (!activity || !pk.length) return pk; const hi = percentile(pk.map(p => p[1]), 90); return pk.filter(([i, v]) => activity[i] >= 0.2 || v >= hi); };
   const toHits = pk => pk.map(([i, v]) => ({ t: +fT(i).toFixed(3), s: +v.toFixed(2) }));
-  const hits = { kick: toHits(kickPk), snare: toHits(snarePk), hat: toHits(hatPk), accent: toHits(accentPk) };
+  const hits = { kick: toHits(gate(kickPk)), snare: toHits(gate(snarePk)), hat: toHits(gate(hatPk)), accent: toHits(accentPk) };
 
   // rhythm grid: inter-onset intervals in beats
   const ioiHist = new Array(49).fill(0); // 0..2 beats in 1/24 steps
@@ -431,17 +483,56 @@ export function analyze(samples, sr, opts = {}) {
     return best;
   };
   const windows = { 7: windowFor(7), 15: windowFor(15), 30: windowFor(30) };
+  // what the reel actually uses: features inside a window (beat confidence, hit strength, model mood over its patches)
+  const mc = ml && ml.feel && ml.feel.curves && ml.feel.curves.t ? ml.feel.curves : null;
+  const winFeat = w => {
+    if (!w) return null;
+    const ks = []; beats.forEach((b, k) => { if (b >= w.start && b < w.end) ks.push(k); });
+    const fr = ks.map(k => beatsF[k]), o = { energy: mean(energy, tF(w.start), tF(w.end)) };
+    o.rise = fr.length ? median(fr.map(f => localMax(F.flux, f, 2))) : 0;
+    o.lowRise = fr.length ? median(fr.map(f => localMax(F.fLow, f, 2))) : 0;
+    if (act) { o.conf = ks.length ? mean(ks.map(k => beatConf[k])) : 0; o.strong = ks.length ? ks.filter(k => beatConf[k] >= 0.5).length / ks.length : 0; }
+    if (mc) for (const key of ['aggressive', 'party', 'relaxed', 'danceable', 'engagement', 'approachability']) {
+      if (!mc[key]) continue; let s = 0, c = 0;
+      for (let p = 0; p < mc.t.length; p++) if (mc.t[p] >= w.start - 1 && mc.t[p] <= w.end + 1) { s += mc[key][p]; c++; }
+      o[key] = c ? s / c : null;
+    }
+    for (const k in o) if (typeof o[k] === 'number') o[k] = +o[k].toFixed(3);
+    return o;
+  };
+  for (const L of [7, 15, 30]) if (windows[L]) windows[L].feat = winFeat(windows[L]);
 
   // ---- scores (heuristics, 0-100; each one explained in the UI) ----
   const punch = 100 * (0.45 * lerp01(rawRise, 0.05, 0.6) + 0.35 * lerp01(rawLowRise, 0.03, 0.2) + 0.2 * lerp01(beatContrast, 1.2, 8));
-  const pulse = 100 * (0.55 * hitRatio + 0.45 * lerp01(tempo.peakAc, 0.05, 0.45)) * (tempoDrift > 8 ? 0.85 : 1);
+  // model-side pulse: how sure the network is about the grid, over the audible part of the song
+  const audibleK = beatsF.map((f, k) => k).filter(k => loud[beatsF[k]] > lp2 + 3);
+  const confMean = act && audibleK.length ? mean(audibleK.map(k => beatConf[k])) : null;
+  const strongShare = act && audibleK.length ? audibleK.filter(k => beatConf[k] >= 0.5).length / audibleK.length : null;
+  const calmShare = activity ? (() => { let c = 0, n = 0; for (let i = 0; i < nF; i++) if (loud[i] > lp2 + 3) { n++; if (activity[i] < 0.2) c++; } return n ? c / n : 0; })() : null;
+  const pulse = act
+    ? 100 * (0.55 * lerp01(confMean, 0.2, 0.8) + 0.45 * strongShare) * (tempoDrift > 8 ? 0.9 : 1)
+    : 100 * (0.55 * hitRatio + 0.45 * lerp01(tempo.peakAc, 0.05, 0.45)) * (tempoDrift > 8 ? 0.85 : 1);
   const strongestDrop = drops.reduce((m, d) => Math.max(m, d.jumpDb + 0.3 * d.lowJumpDb), 0);
   const payoff = 100 * (0.65 * lerp01(strongestDrop, 2.5, 10) + 0.35 * lerp01(lra, 2, 10));
-  const hitsPerBeat = coreF.length ? (kickPk.length + snarePk.length) / coreF.length : 0;
+  const hitsPerBeat = coreF.length ? (hits.kick.length + hits.snare.length) / coreF.length : 0;
   const drive = 100 * (0.6 * lerp01(onsetRate, 1.5, 6) + 0.4 * lerp01(hitsPerBeat, 0.5, 2.5));
   const w15 = windows[15] || windows[7];
   const hook = w15 ? 100 * clamp01(0.45 * w15.firstSec + 0.35 * w15.startHit + 0.2 * (w15.dropAt !== null && Math.abs(w15.dropAt - w15.start) < 0.2 ? 1 : 0.4)) : 0;
-  const overall = 0.3 * punch + 0.2 * pulse + 0.2 * payoff + 0.15 * drive + 0.15 * hook;
+  // Edit power: a small logistic head fitted on a labelled corpus (tests/fit.mjs): 43 songs an editor keeps in a
+  // go-to folder for edits vs 40 calm library tracks (lofi, R&B, soul, ambient). Leave-one-out AUC 0.83 with the
+  // neural features, 0.69 for the DSP-only fallback; held-out phonk, cinematic and trending-edit folders all rank
+  // above the calm ones. The old hand-weighted mix scored 0.43 on the same test, so it is gone.
+  const mood = ml && ml.feel && ml.feel.mood ? ml.feel.mood : null;
+  const lg = p => Math.log(Math.max(1e-3, p) / Math.max(1e-3, 1 - p));
+  const featVal = {
+    intensity: mood ? lg(mood.aggressive) : null, edge: mood ? -lg(mood.approachability) : null,
+    drops: Math.min(4, drops.length), dropSize: Math.min(20, strongestDrop), density: midBusy, sustain: -decayDb, hook: hook / 100,
+  };
+  const head = mood ? EDIT_HEAD : EDIT_HEAD_DSP;
+  let zsum = head.b; const contrib = {};
+  head.names.forEach((n, j) => { const c = head.w[j] * ((featVal[n] - head.mu[j]) / head.sd[j]); contrib[n] = +c.toFixed(2); zsum += c; });
+  const overall = 100 / (1 + Math.exp(-zsum));
+  const intensityScore = mood ? 100 * clamp01(0.55 * lerp01(lg(mood.aggressive), -5, 0) + 0.25 * (1 - mood.relaxed) + 0.2 * mood.party) : null;
   const bpmFast = bpm < 100 ? bpm * 2 : bpm;
   const tempoFitFast = clamp01(1 - Math.abs(bpmFast - 140) / 60);
   const tempoFitSlow = clamp01(1 - Math.abs((bpm > 120 ? bpm / 2 : bpm) - 80) / 40);
@@ -454,20 +545,26 @@ export function analyze(samples, sr, opts = {}) {
   for (const k in fits) fits[k] = Math.round(fits[k]);
 
   // cut plan: cadence per section level
+  for (const s of sections) { const ks = beats.map((b, k) => k).filter(k => beats[k] >= s.start && beats[k] < s.end); s.pulse = ks.length ? +mean(ks.map(k => beatConf[k])).toFixed(2) : 0; }
   const cutPlan = sections.map(s => {
-    const every = s.label === 'Peak' ? (bpm < 100 ? 0.5 : 1) : s.label === 'Mid' || s.label === 'Build' ? 2 : 4;
-    return { start: s.start, end: s.end, label: s.label, everyBeats: every, shotSec: +(every * beatDur).toFixed(2) };
+    let every = s.label === 'Peak' ? (bpm < 100 ? 0.5 : 1) : s.label === 'Mid' || s.label === 'Build' ? 2 : 4;
+    const calm = act && s.pulse < 0.25;
+    if (calm) every = meter * 2; // nothing to cut on: hold shots for two bars and let the big hits do the work
+    return { start: s.start, end: s.end, label: s.label, everyBeats: every, shotSec: +(every * beatDur).toFixed(2), calm: !!calm };
   });
 
   // compact curves for drawing (one value per frame)
   const wave = new Float32Array(nF); for (let i = 0; i < nF; i++) wave[i] = F.peak[i];
   const lowCurve = new Float32Array(nF); { const lp2l = percentile(Array.from(lowDb), 5), lp99l = percentile(Array.from(lowDb), 99); for (let i = 0; i < nF; i++) lowCurve[i] = clamp01((lowDb[i] - lp2l) / (lp99l - lp2l || 1)); }
   const onsetCurve = new Float32Array(nF); { const m = percentile(Array.from(env), 99.5) || 1; for (let i = 0; i < nF; i++) onsetCurve[i] = clamp01(env[i] / m); }
+  const curves = { wave, energy, low: lowCurve, onset: onsetCurve };
+  if (act) { curves.beatProb = act; curves.activity = activity; }
 
   return {
     ok: true, duration, fps, t0,
     bpm: +bpm.toFixed(1), bpmAlts: tempo.alts, tempoConf: +tempo.peakAc.toFixed(3), tempoDrift: +tempoDrift.toFixed(1),
-    beatDur, barDur, beats, downbeats, phase, tempoMap, detected,
+    beatDur, barDur, meter, beats, beatConf, beatPos, barNo, downbeats, phase, tempoMap, detected,
+    model: act ? { used: true, feel: ml.feel && !ml.feel.error ? { mood: ml.feel.mood, styles: ml.feel.styles } : null, feelError: ml.feel && ml.feel.error || null } : { used: false },
     hits, gaps, drops, sections, cutPlan, windows,
     grid: { ...Object.fromEntries(Object.entries(grid).map(([k, v]) => [k, +v.toFixed(3)])), name: gridName }, ioiHist,
     metrics: {
@@ -475,9 +572,11 @@ export function analyze(samples, sr, opts = {}) {
       lra: +lra.toFixed(1), loudMedDb: +loudMed.toFixed(1), onsetRate: +onsetRate.toFixed(2), accentRate: +accentRate.toFixed(1),
       firstHit: firstHitT === null ? null : +firstHitT.toFixed(2), firstBeat: firstBeat === null ? null : +firstBeat.toFixed(2),
       strongestDrop: +strongestDrop.toFixed(1), midBusy: +midBusy.toFixed(2), rawRise: +rawRise.toFixed(3), rawLowRise: +rawLowRise.toFixed(3), decayDb: +decayDb.toFixed(2),
+      confMean: confMean === null ? null : +confMean.toFixed(3), strongShare: strongShare === null ? null : +strongShare.toFixed(3), calmShare: calmShare === null ? null : +calmShare.toFixed(3),
     },
-    scores: { overall: Math.round(overall), punch: Math.round(punch), pulse: Math.round(pulse), payoff: Math.round(payoff), drive: Math.round(drive), hook: Math.round(hook) },
+    scores: { overall: Math.round(overall), punch: Math.round(punch), pulse: Math.round(pulse), payoff: Math.round(payoff), drive: Math.round(drive), hook: Math.round(hook), ...(intensityScore === null ? {} : { intensity: Math.round(intensityScore) }) },
+    editPower: { head: mood ? 'neural' : 'dsp', contrib },
     fits,
-    curves: { wave, energy, low: lowCurve, onset: onsetCurve },
+    curves,
   };
 }

@@ -11,7 +11,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f0e0d'/%3E%3Cpath d='M7 8v16M12 12v8M17 6v20M22 12v8M26 9v14' stroke='%23ff5b2e' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://api.fontshare.com">
 <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700,900&display=swap">
-<link rel="stylesheet" href="style.css?v=4">
+<link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
 <header class="top">
@@ -73,6 +73,7 @@
           <div class="vtext">
             <h2 id="headline">Listening…</h2>
             <p id="summary"></p>
+            <p class="modelStatus" id="modelStatus" aria-live="polite"></p>
           </div>
           <div class="tempo">
             <span class="num" id="bpm">--</span>
@@ -89,7 +90,7 @@
             <div class="zoom"><button class="btn ghost small" id="zoomOut" type="button" aria-label="Zoom out">−</button><button class="btn ghost small" id="zoomIn" type="button" aria-label="Zoom in">+</button><button class="btn ghost small" id="zoomFit" type="button">Fit</button></div>
           </div>
           <canvas id="timeline" height="260" aria-label="Song timeline with beat grid"></canvas>
-          <p class="fine">Click to jump. Scroll to zoom, drag to pan. Faded grid lines are extended through parts with no drums.</p>
+          <p class="fine">Click to jump. Scroll to zoom, drag to pan. Faint grid lines are beats the beat model is unsure of, and shaded stretches have no beat to cut on.</p>
         </div>
       </div>
     </div>
@@ -127,6 +128,11 @@
         <h3 class="mt">Best windows for a reel</h3>
         <div id="windows"></div>
       </div>
+    </div>
+
+    <div class="card">
+      <h3>Feel</h3>
+      <div id="feel"></div>
     </div>
 
     <div class="grid3">
@@ -171,8 +177,9 @@
 
     <details class="card how">
       <summary>How the numbers work</summary>
-      <p>CutGrid splits the audio into 11.6 ms frames, measures how sharply the spectrum jumps in the bass, mid and treble bands, and finds the tempo from how those jumps repeat. A beat tracker then lays the grid, and bar starts come from where the kick and snare fall. Sections come from changes in tone and loudness bar by bar, and a drop is a bar where the level and the low end both jump.</p>
-      <p>The scores are heuristics tuned on EDM, phonk, lofi, trap, ambient techno, piano and film score. Punch is how far the spectrum leaps on each beat, Pulse is how clearly the grid can be heard, Payoff is the strongest drop plus the dynamic range, Drive is how busy the hits are, and Hook rates the best 15 second window's opening second. Edit power weights them 30, 20, 20, 15 and 15. Treat them as a fast first read and trust your ears for the final call.</p>
+      <p>CutGrid reads a song twice. The quick read splits the audio into 11.6 ms frames and measures how sharply the spectrum jumps in the bass, mid and treble bands. The second read runs two small neural networks in your browser. Beat This! (CPJKU, ISMIR 2024) hears where a person would tap the beat and where the bar starts, and it says how sure it is, so calm passages with nothing to cut on are marked instead of filled with fake beats. Discogs-EffNet from the Music Technology Group in Barcelona listens for style and mood. The models download once (about 32 MB) and run on WebGPU when the browser has it.</p>
+      <p>Sections come from changes in tone and loudness bar by bar, and a drop is a bar where the level and the low end both jump.</p>
+      <p>Edit power is a small logistic model. It was fitted on 43 songs an editor keeps for edits (hip-hop instrumentals, film score, phonk, alt) against 40 calm library tracks (lofi, R&amp;B, soul, ambient), and it reads seven things: intensity and edginess from the mood model, the number of drops, drop size, texture density, how long hits hold their weight, and the opening of the best window. On songs it never saw it ranks an edit song above a calm one 83% of the time, and held-out phonk, cinematic and trending-edit folders all land above the calm ones. Punch, Pulse, Payoff, Drive, Hook and Intensity describe the song; they explain the number, but they are not added into it. Treat it as a fast first read and trust your ears for the final call.</p>
     </details>
   </section>
 </main>
@@ -182,6 +189,6 @@
   <a href="https://github.com/sahol3/cutgrid">Source on GitHub</a>
 </footer>
 
-<script type="module" src="app.js?v=4"></script>
+<script type="module" src="app.js?v=5"></script>
 </body>
 </html>

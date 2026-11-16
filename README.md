@@ -6,29 +6,33 @@ Live: https://sahol3.github.io/cutgrid/
 
 ## How it gets the audio
 
-- **Audio file.** Decoded in the browser and analysed in a few seconds. Nothing is uploaded.
+- **Audio file.** Decoded in the browser and analysed there. Nothing is uploaded.
 - **YouTube link.** A static page cannot download YouTube audio, so CutGrid embeds the player and listens to it through tab audio sharing (Chrome or Edge on desktop: choose this tab and keep "Share tab audio" on). The readout fills in while the song plays, and you can stop early.
 
-## What it measures
+## Two reads
 
-The engine (`engine.js`, no dependencies) runs a 1024-point STFT with an 11.6 ms hop, takes the SuperFlux-style spectral flux in bass, mid and treble bands, finds the tempo from the autocorrelation of the onset curve, tracks beats with dynamic programming (Ellis 2007), and picks bar starts from where the kicks and snares fall. Sections come from a checkerboard novelty curve over bar-level tone and loudness. A drop is a bar where the level and the low end both jump, snapped to the first strong kick.
+1. **Quick read (DSP, about a second).** `engine.js` runs a 1024-point STFT with an 11.6 ms hop, takes SuperFlux-style spectral flux in bass, mid and treble bands, finds the tempo from the autocorrelation of the onset curve and tracks beats with dynamic programming (Ellis 2007).
+2. **Neural read (`ml.js`, onnxruntime-web, WebGPU or WASM).**
+   - [Beat This!](https://github.com/CPJKU/beat_this) small0 (Foscarin, Schlüter and Widmer, ISMIR 2024; MIT; ONNX conversion from [ashudesai/songbird-models](https://huggingface.co/ashudesai/songbird-models)) gives beat and downbeat probability at 50 fps. The grid follows it, every beat carries a confidence, bar lines come from a Viterbi pass over bar position (3 or 4 beats), and stretches with no pulse are marked as calm instead of being filled with beats.
+   - [Discogs-EffNet](https://essentia.upf.edu/models.html) with the mood_aggressive, mood_party, mood_relaxed, danceability, engagement and approachability heads (MTG, Universitat Pompeu Fabra; CC BY-NC-SA 4.0) gives the style and mood readout.
+   - The front ends reproduce torchaudio `LogMelSpect` and Essentia `TensorflowInputMusiCNN`; `tests/ml-check.mjs` compares the JS spectrogram and beat probabilities with the PyTorch reference (max difference 1e-5).
 
-Scores (0 to 100) are heuristics tuned on EDM, phonk, lofi, trap, ambient techno, piano and film score:
+Models live in `models/` (about 32 MB) and download once per browser. The Essentia models are licensed for non-commercial use, which is how CutGrid uses them.
 
-| Score | What it reads |
-|---|---|
-| Punch | How far the spectrum and the bass leap on each beat |
-| Pulse | Share of beats with an audible hit, plus tempo clarity and drift |
-| Payoff | Strongest drop and the dynamic range |
-| Drive | Hits per second and kick/snare density |
-| Hook | Opening energy and hit of the best 15 second window |
+## Scores
 
-Edit power weights them 30, 20, 20, 15 and 15.
+Scores (0 to 100) are explained in the page. Edit power weights Punch, Pulse, Payoff, Drive and Hook; the weights and the model features were checked against a labelled set of songs (see `tests/corpus.mjs`).
 
 ## Exports
 
-Markers CSV (seconds and 30 fps timecode), Audacity label track, full JSON, and the cut list for the chosen cadence.
+Markers CSV (seconds and 30 fps timecode), Audacity label track, full JSON, and the cut list for the chosen cadence. Beats the model marks as calm are left out of the markers.
 
 ## Run locally
 
-Any static server works, for example `py -m http.server 8000`. Tests: `node tests/run.mjs` runs the click-track timing check; `node tests/run.mjs song.mp3` prints the summary for real files (needs ffmpeg).
+Any static server works, for example `py -m http.server 8000`.
+
+- `npm i` (dev only: onnxruntime-node and onnxruntime-web 1.22.0)
+- `node tests/run.mjs` runs the click-track timing check; `node tests/run.mjs song.mp3` prints the summary for real files (needs ffmpeg).
+- `node tests/ml-check.mjs song.mp3` runs both networks in Node; `tests/ml-dump.mjs` caches their output for `tests/corpus.mjs`.
+- `node tests/browser.mjs [url] [song.f32]` drives the page in headless Chromium (playwright-core).
+- `py tools/export_beatthis.py song.mp3` fetches the beat model and writes the PyTorch reference used by `ml-check`.
