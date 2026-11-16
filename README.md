@@ -2,7 +2,7 @@
 
 An editor's preview of a song. Paste a YouTube link or drop an audio file and CutGrid shows the BPM, the beat and bar grid, kicks, snares and hats, drops, sections, the best 7, 15 and 30 second reel windows, and a 9:16 cut preview that plays placeholder shots on the beat so you can feel the pacing before the song goes near your timeline.
 
-Live: https://sahol3.github.io/cutgrid/
+Live: https://kronx.me/cutgrid/
 
 ## How it gets the audio
 
